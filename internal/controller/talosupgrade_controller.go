@@ -22,7 +22,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -78,7 +77,7 @@ func (r *TalosUpgradeReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	}
 
 	if upgrade.Spec.EdgeHAConfig != nil {
-		return r.reconcileEdgeHA(ctx, log, &upgrade)
+		return r.reconcileEdgeHA(ctx, &upgrade)
 	}
 
 	// Standard logic for non-edge upgrades
@@ -122,7 +121,8 @@ func (r *TalosUpgradeReconciler) Reconcile(ctx context.Context, req ctrl.Request
 }
 
 // reconcileEdgeHA handles the complex state machine for upgrading edge nodes with HA.
-func (r *TalosUpgradeReconciler) reconcileEdgeHA(ctx context.Context, log logr.Logger, upgrade *upgradev1alpha1.TalosUpgrade) (ctrl.Result, error) {
+func (r *TalosUpgradeReconciler) reconcileEdgeHA(ctx context.Context, upgrade *upgradev1alpha1.TalosUpgrade) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
 	switch upgrade.Status.EdgeUpgradeState {
 	case StatePending:
 		log.Info("Scaling Envoy Proxy to 2 replicas")
@@ -132,7 +132,9 @@ func (r *TalosUpgradeReconciler) reconcileEdgeHA(ctx context.Context, log logr.L
 		}
 		upgrade.Status.EdgeUpgradeState = StateDeployingTempProxy
 		upgrade.Status.Message = "Scaled EnvoyProxy to 2 replicas. Waiting for pods to be Ready."
-		r.Status().Update(ctx, upgrade)
+		if err := r.Status().Update(ctx, upgrade); err != nil {
+			return ctrl.Result{}, err
+		}
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 
 	case StateDeployingTempProxy:
@@ -146,7 +148,9 @@ func (r *TalosUpgradeReconciler) reconcileEdgeHA(ctx context.Context, log logr.L
 		upgrade.Status.TempWorkerIP = "203.0.113.1" // Placeholder worker IP
 		upgrade.Status.EdgeUpgradeState = StateWaitingDNSPropagationToTemp
 		upgrade.Status.Message = "Cloudflare A record updated to worker IP. Waiting for DNS propagation."
-		r.Status().Update(ctx, upgrade)
+		if err := r.Status().Update(ctx, upgrade); err != nil {
+			return ctrl.Result{}, err
+		}
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 
 	case StateWaitingDNSPropagationToTemp:
@@ -156,7 +160,9 @@ func (r *TalosUpgradeReconciler) reconcileEdgeHA(ctx context.Context, log logr.L
 
 		upgrade.Status.EdgeUpgradeState = StateUpgradingEdgeNode
 		upgrade.Status.Message = "DNS propagated. Initiating edge node upgrade."
-		r.Status().Update(ctx, upgrade)
+		if err := r.Status().Update(ctx, upgrade); err != nil {
+			return ctrl.Result{}, err
+		}
 		return ctrl.Result{}, nil
 
 	case StateUpgradingEdgeNode:
@@ -166,7 +172,9 @@ func (r *TalosUpgradeReconciler) reconcileEdgeHA(ctx context.Context, log logr.L
 
 		upgrade.Status.EdgeUpgradeState = StateWaitingDNSPropagationToEdge
 		upgrade.Status.Message = "Edge node upgraded. Reverting Cloudflare A record to original IP."
-		r.Status().Update(ctx, upgrade)
+		if err := r.Status().Update(ctx, upgrade); err != nil {
+			return ctrl.Result{}, err
+		}
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 
 	case StateWaitingDNSPropagationToEdge:
@@ -175,7 +183,9 @@ func (r *TalosUpgradeReconciler) reconcileEdgeHA(ctx context.Context, log logr.L
 
 		upgrade.Status.EdgeUpgradeState = StateCleaningUp
 		upgrade.Status.Message = "DNS propagated back. Cleaning up temporary proxy."
-		r.Status().Update(ctx, upgrade)
+		if err := r.Status().Update(ctx, upgrade); err != nil {
+			return ctrl.Result{}, err
+		}
 		return ctrl.Result{}, nil
 
 	case StateCleaningUp:
@@ -187,7 +197,9 @@ func (r *TalosUpgradeReconciler) reconcileEdgeHA(ctx context.Context, log logr.L
 		upgrade.Status.EdgeUpgradeState = StateDone
 		upgrade.Status.Phase = "UpToDate"
 		upgrade.Status.Message = "Edge Node HA upgrade complete."
-		r.Status().Update(ctx, upgrade)
+		if err := r.Status().Update(ctx, upgrade); err != nil {
+			return ctrl.Result{}, err
+		}
 		return ctrl.Result{}, nil
 
 	case StateDone:
