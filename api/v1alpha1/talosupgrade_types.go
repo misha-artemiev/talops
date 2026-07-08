@@ -75,9 +75,13 @@ type TalosUpgradeStatus struct {
 	// +optional
 	Phase string `json:"phase,omitempty"`
 
-	// EdgeUpgradeState tracks the state of the Edge Node HA workflow.
+	// CurrentNode tracks the name of the node currently undergoing upgrade.
 	// +optional
-	EdgeUpgradeState string `json:"edgeUpgradeState,omitempty"`
+	CurrentNode string `json:"currentNode,omitempty"`
+
+	// NodeUpgradeState tracks the state of the Node upgrade workflow.
+	// +optional
+	NodeUpgradeState string `json:"nodeUpgradeState,omitempty"`
 
 	// TempWorkerIP stores the IP of the worker node temporarily running Envoy.
 	// +optional
@@ -90,6 +94,10 @@ type TalosUpgradeStatus struct {
 	// Message is a human-readable message about the current state.
 	// +optional
 	Message string `json:"message,omitempty"`
+
+	// LastTransitionTime tracks when the state machine last transitioned.
+	// +optional
+	LastTransitionTime *metav1.Time `json:"lastTransitionTime,omitempty"`
 
 	// For Kubernetes API conventions, see:
 	// https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md#typical-status-properties

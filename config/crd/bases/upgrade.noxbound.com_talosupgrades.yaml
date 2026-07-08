@@ -264,13 +264,22 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
-              edgeUpgradeState:
-                description: EdgeUpgradeState tracks the state of the Edge Node HA
-                  workflow.
+              currentNode:
+                description: CurrentNode tracks the name of the node currently undergoing
+                  upgrade.
+                type: string
+              lastTransitionTime:
+                description: LastTransitionTime tracks when the state machine last
+                  transitioned.
+                format: date-time
                 type: string
               message:
                 description: Message is a human-readable message about the current
                   state.
+                type: string
+              nodeUpgradeState:
+                description: NodeUpgradeState tracks the state of the Node upgrade
+                  workflow.
                 type: string
               originalEdgeIP:
                 description: OriginalEdgeIP stores the original IP of the edge node.
