@@ -8,4 +8,14 @@ layout:
 - go.kubebuilder.io/v4
 projectName: talops
 repo: github.com/misha-artemiev/talops
+resources:
+- api:
+    crdVersion: v1
+    namespaced: true
+  controller: true
+  domain: noxbound.com
+  group: upgrade
+  kind: TalosUpgrade
+  path: github.com/misha-artemiev/talops/api/v1alpha1
+  version: v1alpha1
 version: "3"

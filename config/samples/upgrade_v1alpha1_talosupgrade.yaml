@@ -1,0 +1,9 @@
+apiVersion: upgrade.noxbound.com/v1alpha1
+kind: TalosUpgrade
+metadata:
+  labels:
+    app.kubernetes.io/name: talops
+    app.kubernetes.io/managed-by: kustomize
+  name: talosupgrade-sample
+spec:
+  # TODO(user): Add fields here

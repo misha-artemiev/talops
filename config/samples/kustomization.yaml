@@ -1,0 +1,4 @@
+## Append samples of your project ##
+resources:
+- upgrade_v1alpha1_talosupgrade.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples
