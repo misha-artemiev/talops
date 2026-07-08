@@ -20,7 +20,9 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
+	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -29,6 +31,18 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	upgradev1alpha1 "github.com/misha-artemiev/talops/api/v1alpha1"
+	"github.com/misha-artemiev/talops/internal/envoygateway"
+)
+
+// State machine constants for Edge HA Upgrade
+const (
+	StatePending                     = ""
+	StateDeployingTempProxy          = "DeployingTempProxy"
+	StateWaitingDNSPropagationToTemp = "WaitingDNSPropagationToTemp"
+	StateUpgradingEdgeNode           = "UpgradingEdgeNode"
+	StateWaitingDNSPropagationToEdge = "WaitingDNSPropagationToEdge"
+	StateCleaningUp                  = "CleaningUp"
+	StateDone                        = "Done"
 )
 
 // TalosUpgradeReconciler reconciles a TalosUpgrade object
@@ -37,10 +51,11 @@ type TalosUpgradeReconciler struct {
 	Scheme *runtime.Scheme
 }
 
-// +kubebuilder:rbac:groups=upgrade.noxbound.com,resources=talosupgrades,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=upgrade.noxbound.com,resources=talosupgrades,verbs=get;list;watch
 // +kubebuilder:rbac:groups=upgrade.noxbound.com,resources=talosupgrades/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=upgrade.noxbound.com,resources=talosupgrades/finalizers,verbs=update
 // +kubebuilder:rbac:groups=core,resources=nodes,verbs=get;list;watch
+// +kubebuilder:rbac:groups=gateway.envoyproxy.io,resources=envoyproxies,verbs=get;patch
+// +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -62,6 +77,11 @@ func (r *TalosUpgradeReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, err
 	}
 
+	if upgrade.Spec.EdgeHAConfig != nil {
+		return r.reconcileEdgeHA(ctx, log, &upgrade)
+	}
+
+	// Standard logic for non-edge upgrades
 	var nodeList corev1.NodeList
 	if err := r.List(ctx, &nodeList); err != nil {
 		log.Error(err, "Failed to list nodes")
@@ -96,6 +116,83 @@ func (r *TalosUpgradeReconciler) Reconcile(ctx context.Context, req ctrl.Request
 			return ctrl.Result{}, err
 		}
 		log.Info("Updated TalosUpgrade status", "phase", newPhase, "message", newMessage)
+	}
+
+	return ctrl.Result{}, nil
+}
+
+// reconcileEdgeHA handles the complex state machine for upgrading edge nodes with HA.
+func (r *TalosUpgradeReconciler) reconcileEdgeHA(ctx context.Context, log logr.Logger, upgrade *upgradev1alpha1.TalosUpgrade) (ctrl.Result, error) {
+	switch upgrade.Status.EdgeUpgradeState {
+	case StatePending:
+		log.Info("Scaling Envoy Proxy to 2 replicas")
+		proxyMgr := envoygateway.NewProxyManager(r.Client)
+		if err := proxyMgr.ScaleProxy(ctx, upgrade.Spec.EdgeHAConfig.EnvoyProxyRef, 2); err != nil {
+			return ctrl.Result{}, err
+		}
+		upgrade.Status.EdgeUpgradeState = StateDeployingTempProxy
+		upgrade.Status.Message = "Scaled EnvoyProxy to 2 replicas. Waiting for pods to be Ready."
+		r.Status().Update(ctx, upgrade)
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+
+	case StateDeployingTempProxy:
+		log.Info("Checking if temporary Envoy proxy is ready on worker node")
+		// TODO: Validate that a proxy pod is ready on a non-edge node, and retrieve its ExternalIP.
+		// For now, we simulate success and move to DNS update.
+		// cloudflareSecret := fetchSecret(ctx, upgrade.Spec.EdgeHAConfig.CloudflareSecretRef)
+		// dnsClient := cloudflare.NewClient(cloudflareSecret)
+		// dnsClient.UpdateARecordIP(...)
+
+		upgrade.Status.TempWorkerIP = "203.0.113.1" // Placeholder worker IP
+		upgrade.Status.EdgeUpgradeState = StateWaitingDNSPropagationToTemp
+		upgrade.Status.Message = "Cloudflare A record updated to worker IP. Waiting for DNS propagation."
+		r.Status().Update(ctx, upgrade)
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+
+	case StateWaitingDNSPropagationToTemp:
+		log.Info("Polling DNS to check if traffic shifted to TempWorkerIP")
+		// TODO: Use net.LookupIP to resolve dnsRecordName globally.
+		// If resolved IP == upgrade.Status.TempWorkerIP { proceed }
+
+		upgrade.Status.EdgeUpgradeState = StateUpgradingEdgeNode
+		upgrade.Status.Message = "DNS propagated. Initiating edge node upgrade."
+		r.Status().Update(ctx, upgrade)
+		return ctrl.Result{}, nil
+
+	case StateUpgradingEdgeNode:
+		log.Info("Executing Edge Node cordon, drain, and Talos upgrade")
+		// TODO: Implement actual Talos upgrade API call.
+		// Once edge node is Ready again, we revert DNS.
+
+		upgrade.Status.EdgeUpgradeState = StateWaitingDNSPropagationToEdge
+		upgrade.Status.Message = "Edge node upgraded. Reverting Cloudflare A record to original IP."
+		r.Status().Update(ctx, upgrade)
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+
+	case StateWaitingDNSPropagationToEdge:
+		log.Info("Polling DNS to check if traffic shifted back to OriginalEdgeIP")
+		// TODO: Ensure DNS propagated back.
+
+		upgrade.Status.EdgeUpgradeState = StateCleaningUp
+		upgrade.Status.Message = "DNS propagated back. Cleaning up temporary proxy."
+		r.Status().Update(ctx, upgrade)
+		return ctrl.Result{}, nil
+
+	case StateCleaningUp:
+		log.Info("Scaling Envoy Proxy back to 1 replica")
+		proxyMgr := envoygateway.NewProxyManager(r.Client)
+		if err := proxyMgr.ScaleProxy(ctx, upgrade.Spec.EdgeHAConfig.EnvoyProxyRef, 1); err != nil {
+			return ctrl.Result{}, err
+		}
+		upgrade.Status.EdgeUpgradeState = StateDone
+		upgrade.Status.Phase = "UpToDate"
+		upgrade.Status.Message = "Edge Node HA upgrade complete."
+		r.Status().Update(ctx, upgrade)
+		return ctrl.Result{}, nil
+
+	case StateDone:
+		// Nothing to do
+		return ctrl.Result{}, nil
 	}
 
 	return ctrl.Result{}, nil

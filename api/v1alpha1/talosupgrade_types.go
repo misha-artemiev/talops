@@ -17,12 +17,36 @@ limitations under the License.
 package v1alpha1
 
 import (
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
 // EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
 // NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
+
+// EdgeHAConfig defines the configuration for High Availability during edge node upgrades.
+type EdgeHAConfig struct {
+	// NodeSelector defines which nodes are considered "edge nodes".
+	// +optional
+	NodeSelector *metav1.LabelSelector `json:"nodeSelector,omitempty"`
+
+	// CloudflareSecretRef refers to the secret containing Cloudflare API tokens.
+	// +optional
+	CloudflareSecretRef *corev1.SecretKeySelector `json:"cloudflareSecretRef,omitempty"`
+
+	// CloudflareZoneID is the zone ID where the DNS record lives.
+	// +optional
+	CloudflareZoneID string `json:"cloudflareZoneID,omitempty"`
+
+	// DNSRecordName is the DNS A record to shift during the upgrade (e.g. api.example.com).
+	// +optional
+	DNSRecordName string `json:"dnsRecordName,omitempty"`
+
+	// EnvoyProxyRef refers to the EnvoyProxy resource to patch.
+	// +optional
+	EnvoyProxyRef *corev1.ObjectReference `json:"envoyProxyRef,omitempty"`
+}
 
 // TalosUpgradeSpec defines the desired state of TalosUpgrade
 type TalosUpgradeSpec struct {
@@ -36,6 +60,10 @@ type TalosUpgradeSpec struct {
 	// KubernetesVersion is the desired Kubernetes version (e.g. "v1.30.2").
 	// +required
 	KubernetesVersion string `json:"kubernetesVersion"`
+
+	// EdgeHAConfig defines the configuration for High Availability during edge node upgrades.
+	// +optional
+	EdgeHAConfig *EdgeHAConfig `json:"edgeHAConfig,omitempty"`
 }
 
 // TalosUpgradeStatus defines the observed state of TalosUpgrade.
@@ -46,6 +74,18 @@ type TalosUpgradeStatus struct {
 	// Phase indicates the current state evaluated by the operator.
 	// +optional
 	Phase string `json:"phase,omitempty"`
+
+	// EdgeUpgradeState tracks the state of the Edge Node HA workflow.
+	// +optional
+	EdgeUpgradeState string `json:"edgeUpgradeState,omitempty"`
+
+	// TempWorkerIP stores the IP of the worker node temporarily running Envoy.
+	// +optional
+	TempWorkerIP string `json:"tempWorkerIP,omitempty"`
+
+	// OriginalEdgeIP stores the original IP of the edge node.
+	// +optional
+	OriginalEdgeIP string `json:"originalEdgeIP,omitempty"`
 
 	// Message is a human-readable message about the current state.
 	// +optional

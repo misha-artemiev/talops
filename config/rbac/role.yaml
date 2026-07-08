@@ -8,28 +8,26 @@ rules:
   - ""
   resources:
   - nodes
+  - secrets
   verbs:
   - get
   - list
   - watch
+- apiGroups:
+  - gateway.envoyproxy.io
+  resources:
+  - envoyproxies
+  verbs:
+  - get
+  - patch
 - apiGroups:
   - upgrade.noxbound.com
   resources:
   - talosupgrades
   verbs:
-  - create
-  - delete
   - get
   - list
-  - patch
-  - update
   - watch
-- apiGroups:
-  - upgrade.noxbound.com
-  resources:
-  - talosupgrades/finalizers
-  verbs:
-  - update
 - apiGroups:
   - upgrade.noxbound.com
   resources:
