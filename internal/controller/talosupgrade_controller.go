@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"slices"
 	"strings"
 	"time"
 
@@ -63,6 +64,7 @@ func checkTimeout(upgrade *upgradev1alpha1.TalosUpgrade, timeout time.Duration) 
 
 // State machine constants for Edge HA Upgrade
 const (
+	PhaseUpToDate                    = "UpToDate"
 	StatePending                     = ""
 	StateDeployingTempProxy          = "DeployingTempProxy"
 	StateWaitingDNSPropagationToTemp = "WaitingDNSPropagationToTemp"
@@ -114,14 +116,14 @@ func (r *TalosUpgradeReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	}
 
 	if len(mismatchedNodes) == 0 {
-		if upgrade.Status.Phase != "UpToDate" || upgrade.Status.CurrentNode != "" {
-			upgrade.Status.Phase = "UpToDate"
+		if upgrade.Status.Phase != PhaseUpToDate || upgrade.Status.CurrentNode != "" {
+			upgrade.Status.Phase = PhaseUpToDate
 			upgrade.Status.CurrentNode = ""
 			upgrade.Status.Message = "All nodes are running the desired versions"
 			if err := r.Status().Update(ctx, &upgrade); err != nil {
 				return ctrl.Result{}, err
 			}
-			log.Info("Updated TalosUpgrade status", "phase", "UpToDate")
+			log.Info("Updated TalosUpgrade status", "phase", PhaseUpToDate)
 		}
 		return ctrl.Result{}, nil
 	}
@@ -185,8 +187,6 @@ func (r *TalosUpgradeReconciler) Reconcile(ctx context.Context, req ctrl.Request
 
 // reconcileEdgeHA handles the complex state machine for upgrading edge nodes with HA.
 func (r *TalosUpgradeReconciler) reconcileEdgeHA(ctx context.Context, upgrade *upgradev1alpha1.TalosUpgrade) (ctrl.Result, error) {
-	log := logf.FromContext(ctx)
-
 	// Initialize transition time if nil
 	if upgrade.Status.LastTransitionTime == nil {
 		now := metav1.Now()
@@ -198,231 +198,235 @@ func (r *TalosUpgradeReconciler) reconcileEdgeHA(ctx context.Context, upgrade *u
 
 	switch upgrade.Status.NodeUpgradeState {
 	case StatePending:
-		log.Info("Scaling Envoy Proxy to 2 replicas")
-		proxyMgr := envoygateway.NewProxyManager(r.Client)
-		if err := proxyMgr.ScaleProxy(ctx, upgrade.Spec.EdgeHAConfig.EnvoyProxyRef, 2); err != nil {
-			return ctrl.Result{}, err
-		}
-
-		// Pre-fetch OriginalEdgeIP to ensure we have it before we change DNS
-		if upgrade.Status.OriginalEdgeIP == "" {
-			ips, err := net.LookupHost(upgrade.Spec.EdgeHAConfig.DNSRecordName)
-			if err == nil && len(ips) > 0 {
-				upgrade.Status.OriginalEdgeIP = ips[0]
-			}
-		}
-
-		transitionState(upgrade, StateDeployingTempProxy, "Scaled EnvoyProxy to 2 replicas. Waiting for pods to be Ready.")
-		if err := r.Status().Update(ctx, upgrade); err != nil {
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-
+		return r.handleEdgeStatePending(ctx, upgrade)
 	case StateDeployingTempProxy:
-		log.Info("Checking if temporary Envoy proxy is ready on worker node")
+		return r.handleEdgeStateDeployingTempProxy(ctx, upgrade)
+	case StateWaitingDNSPropagationToTemp:
+		return r.handleEdgeStateWaitingDNSPropagationToTemp(ctx, upgrade)
+	case StateUpgradingEdgeNode:
+		return r.handleEdgeStateUpgradingEdgeNode(ctx, upgrade)
+	case StateWaitingDNSPropagationToEdge:
+		return r.handleEdgeStateWaitingDNSPropagationToEdge(ctx, upgrade)
+	case StateCleaningUp:
+		return r.handleEdgeStateCleaningUp(ctx, upgrade)
+	case StateDone, "Error":
+		return ctrl.Result{}, nil
+	default:
+		return ctrl.Result{}, nil
+	}
+}
 
-		if checkTimeout(upgrade, 10*time.Minute) {
-			transitionState(upgrade, "Error", "Timeout waiting for temporary proxy to become ready.")
-			r.Status().Update(ctx, upgrade)
-			return ctrl.Result{}, nil
+func (r *TalosUpgradeReconciler) handleEdgeStatePending(ctx context.Context, upgrade *upgradev1alpha1.TalosUpgrade) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+	log.Info("Scaling Envoy Proxy to 2 replicas")
+	proxyMgr := envoygateway.NewProxyManager(r.Client)
+	if err := proxyMgr.ScaleProxy(ctx, upgrade.Spec.EdgeHAConfig.EnvoyProxyRef, 2); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if upgrade.Status.OriginalEdgeIP == "" {
+		ips, err := net.LookupHost(upgrade.Spec.EdgeHAConfig.DNSRecordName)
+		if err == nil && len(ips) > 0 {
+			upgrade.Status.OriginalEdgeIP = ips[0]
 		}
+	}
 
-		var nodeList corev1.NodeList
-		if err := r.List(ctx, &nodeList); err != nil {
-			return ctrl.Result{}, err
-		}
+	transitionState(upgrade, StateDeployingTempProxy, "Scaled EnvoyProxy to 2 replicas. Waiting for pods to be Ready.")
+	if err := r.Status().Update(ctx, upgrade); err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+}
 
-		var tempWorkerIP string
-		selector, err := metav1.LabelSelectorAsSelector(upgrade.Spec.EdgeHAConfig.NodeSelector)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
+func (r *TalosUpgradeReconciler) handleEdgeStateDeployingTempProxy(ctx context.Context, upgrade *upgradev1alpha1.TalosUpgrade) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+	log.Info("Checking if temporary Envoy proxy is ready on worker node")
 
-		for _, node := range nodeList.Items {
-			if !selector.Matches(labels.Set(node.Labels)) {
+	if checkTimeout(upgrade, 10*time.Minute) {
+		transitionState(upgrade, "Error", "Timeout waiting for temporary proxy to become ready.")
+		_ = r.Status().Update(ctx, upgrade) // Error state updated, ignoring failure to update error state.
+		return ctrl.Result{}, nil
+	}
+
+	var nodeList corev1.NodeList
+	if err := r.List(ctx, &nodeList); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	var tempWorkerIP string
+	selector, err := metav1.LabelSelectorAsSelector(upgrade.Spec.EdgeHAConfig.NodeSelector)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	for _, node := range nodeList.Items {
+		if !selector.Matches(labels.Set(node.Labels)) {
+			for _, addr := range node.Status.Addresses {
+				if addr.Type == corev1.NodeExternalIP {
+					tempWorkerIP = addr.Address
+					break
+				}
+			}
+			if tempWorkerIP == "" {
 				for _, addr := range node.Status.Addresses {
-					if addr.Type == corev1.NodeExternalIP {
+					if addr.Type == corev1.NodeInternalIP {
 						tempWorkerIP = addr.Address
 						break
 					}
 				}
-				if tempWorkerIP == "" {
-					for _, addr := range node.Status.Addresses {
-						if addr.Type == corev1.NodeInternalIP {
-							tempWorkerIP = addr.Address
-							break
-						}
-					}
-				}
-				break
 			}
+			break
 		}
+	}
 
-		if tempWorkerIP == "" {
-			log.Info("No available worker node found")
-			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
-		}
-
-		// Actively verify proxy port is open
-		conn, err := net.DialTimeout("tcp", net.JoinHostPort(tempWorkerIP, "443"), 2*time.Second)
-		if err != nil {
-			log.Info("Proxy not yet answering on worker node", "ip", tempWorkerIP)
-			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-		}
-		conn.Close()
-
-		log.Info("Proxy is ready! Updating Cloudflare DNS", "ip", tempWorkerIP)
-		var cfSecret corev1.Secret
-		secretKey := client.ObjectKey{
-			Namespace: upgrade.Namespace,
-			Name:      upgrade.Spec.EdgeHAConfig.CloudflareSecretRef.Name,
-		}
-		if err := r.Get(ctx, secretKey, &cfSecret); err != nil {
-			return ctrl.Result{}, err
-		}
-
-		cfClient, err := cloudflare.NewClient(string(cfSecret.Data[upgrade.Spec.EdgeHAConfig.CloudflareSecretRef.Key]))
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-
-		err = cfClient.UpdateARecordIP(ctx, upgrade.Spec.EdgeHAConfig.CloudflareZoneID, upgrade.Spec.EdgeHAConfig.DNSRecordName, tempWorkerIP)
-		if err != nil {
-			log.Error(err, "Failed to update Cloudflare DNS")
-			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
-		}
-
-		upgrade.Status.TempWorkerIP = tempWorkerIP
-		transitionState(upgrade, StateWaitingDNSPropagationToTemp, "Cloudflare A record updated to worker IP. Waiting for DNS propagation.")
-		if err := r.Status().Update(ctx, upgrade); err != nil {
-			return ctrl.Result{}, err
-		}
+	if tempWorkerIP == "" {
+		log.Info("No available worker node found")
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
 
-	case StateWaitingDNSPropagationToTemp:
-		log.Info("Polling DNS to check if traffic shifted to TempWorkerIP")
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(tempWorkerIP, "443"), 2*time.Second)
+	if err != nil {
+		log.Info("Proxy not yet answering on worker node", "ip", tempWorkerIP)
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+	_ = conn.Close()
 
-		if checkTimeout(upgrade, 15*time.Minute) {
-			transitionState(upgrade, "Error", "Timeout waiting for DNS to propagate.")
-			r.Status().Update(ctx, upgrade)
-			return ctrl.Result{}, nil
-		}
+	log.Info("Proxy is ready! Updating Cloudflare DNS", "ip", tempWorkerIP)
+	var cfSecret corev1.Secret
+	secretKey := client.ObjectKey{
+		Namespace: upgrade.Namespace,
+		Name:      upgrade.Spec.EdgeHAConfig.CloudflareSecretRef.Name,
+	}
+	if err := r.Get(ctx, secretKey, &cfSecret); err != nil {
+		return ctrl.Result{}, err
+	}
 
-		ips, err := net.LookupHost(upgrade.Spec.EdgeHAConfig.DNSRecordName)
-		if err != nil {
-			log.Error(err, "DNS lookup failed")
-			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
-		}
+	cfClient, err := cloudflare.NewClient(string(cfSecret.Data[upgrade.Spec.EdgeHAConfig.CloudflareSecretRef.Key]))
+	if err != nil {
+		return ctrl.Result{}, err
+	}
 
-		propagated := false
-		for _, ip := range ips {
-			if ip == upgrade.Status.TempWorkerIP {
-				propagated = true
-				break
-			}
-		}
-
-		if !propagated {
-			log.Info("DNS not yet propagated", "expected", upgrade.Status.TempWorkerIP, "got", ips)
-			return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
-		}
-
-		transitionState(upgrade, StateUpgradingEdgeNode, "DNS propagated. Initiating edge node upgrade.")
-		if err := r.Status().Update(ctx, upgrade); err != nil {
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{}, nil
-
-	case StateUpgradingEdgeNode:
-		log.Info("Executing Edge Node cordon, drain, and Talos upgrade")
-		// TODO: Implement actual Talos upgrade API call.
-
-		if checkTimeout(upgrade, 30*time.Minute) {
-			transitionState(upgrade, "Error", "Timeout waiting for Edge Node upgrade.")
-			r.Status().Update(ctx, upgrade)
-			return ctrl.Result{}, nil
-		}
-
-		// Revert DNS
-		var cfSecret corev1.Secret
-		secretKey := client.ObjectKey{
-			Namespace: upgrade.Namespace,
-			Name:      upgrade.Spec.EdgeHAConfig.CloudflareSecretRef.Name,
-		}
-		if err := r.Get(ctx, secretKey, &cfSecret); err != nil {
-			return ctrl.Result{}, err
-		}
-
-		cfClient, err := cloudflare.NewClient(string(cfSecret.Data[upgrade.Spec.EdgeHAConfig.CloudflareSecretRef.Key]))
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-
-		err = cfClient.UpdateARecordIP(ctx, upgrade.Spec.EdgeHAConfig.CloudflareZoneID, upgrade.Spec.EdgeHAConfig.DNSRecordName, upgrade.Status.OriginalEdgeIP)
-		if err != nil {
-			log.Error(err, "Failed to revert Cloudflare DNS")
-			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
-		}
-
-		transitionState(upgrade, StateWaitingDNSPropagationToEdge, "Edge node upgraded. Reverting Cloudflare A record to original IP.")
-		if err := r.Status().Update(ctx, upgrade); err != nil {
-			return ctrl.Result{}, err
-		}
+	err = cfClient.UpdateARecordIP(ctx, upgrade.Spec.EdgeHAConfig.CloudflareZoneID, upgrade.Spec.EdgeHAConfig.DNSRecordName, tempWorkerIP)
+	if err != nil {
+		log.Error(err, "Failed to update Cloudflare DNS")
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
 
-	case StateWaitingDNSPropagationToEdge:
-		log.Info("Polling DNS to check if traffic shifted back to OriginalEdgeIP")
+	upgrade.Status.TempWorkerIP = tempWorkerIP
+	transitionState(upgrade, StateWaitingDNSPropagationToTemp, "Cloudflare A record updated to worker IP. Waiting for DNS propagation.")
+	if err := r.Status().Update(ctx, upgrade); err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+}
 
-		if checkTimeout(upgrade, 15*time.Minute) {
-			transitionState(upgrade, "Error", "Timeout waiting for DNS to propagate back.")
-			r.Status().Update(ctx, upgrade)
-			return ctrl.Result{}, nil
-		}
+func (r *TalosUpgradeReconciler) handleEdgeStateWaitingDNSPropagationToTemp(ctx context.Context, upgrade *upgradev1alpha1.TalosUpgrade) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+	log.Info("Polling DNS to check if traffic shifted to TempWorkerIP")
 
-		ips, err := net.LookupHost(upgrade.Spec.EdgeHAConfig.DNSRecordName)
-		if err != nil {
-			log.Error(err, "DNS lookup failed")
-			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
-		}
-
-		propagated := false
-		for _, ip := range ips {
-			if ip == upgrade.Status.OriginalEdgeIP {
-				propagated = true
-				break
-			}
-		}
-
-		if !propagated {
-			log.Info("DNS not yet propagated back", "expected", upgrade.Status.OriginalEdgeIP, "got", ips)
-			return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
-		}
-
-		transitionState(upgrade, StateCleaningUp, "DNS propagated back. Cleaning up temporary proxy.")
-		if err := r.Status().Update(ctx, upgrade); err != nil {
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{}, nil
-
-	case StateCleaningUp:
-		log.Info("Scaling Envoy Proxy back to 1 replica")
-		proxyMgr := envoygateway.NewProxyManager(r.Client)
-		if err := proxyMgr.ScaleProxy(ctx, upgrade.Spec.EdgeHAConfig.EnvoyProxyRef, 1); err != nil {
-			return ctrl.Result{}, err
-		}
-		transitionState(upgrade, StateDone, "Edge Node HA upgrade complete.")
-		upgrade.Status.Phase = "UpToDate"
-		if err := r.Status().Update(ctx, upgrade); err != nil {
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{}, nil
-
-	case StateDone:
-		return ctrl.Result{}, nil
-	case "Error":
+	if checkTimeout(upgrade, 15*time.Minute) {
+		transitionState(upgrade, "Error", "Timeout waiting for DNS to propagate.")
+		_ = r.Status().Update(ctx, upgrade)
 		return ctrl.Result{}, nil
 	}
 
+	ips, err := net.LookupHost(upgrade.Spec.EdgeHAConfig.DNSRecordName)
+	if err != nil {
+		log.Error(err, "DNS lookup failed")
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+
+	if !slices.Contains(ips, upgrade.Status.TempWorkerIP) {
+		log.Info("DNS not yet propagated", "expected", upgrade.Status.TempWorkerIP, "got", ips)
+		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
+	}
+
+	transitionState(upgrade, StateUpgradingEdgeNode, "DNS propagated. Initiating edge node upgrade.")
+	if err := r.Status().Update(ctx, upgrade); err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{}, nil
+}
+
+func (r *TalosUpgradeReconciler) handleEdgeStateUpgradingEdgeNode(ctx context.Context, upgrade *upgradev1alpha1.TalosUpgrade) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+	log.Info("Executing Edge Node cordon, drain, and Talos upgrade")
+	// TODO: Implement actual Talos upgrade API call.
+
+	if checkTimeout(upgrade, 30*time.Minute) {
+		transitionState(upgrade, "Error", "Timeout waiting for Edge Node upgrade.")
+		_ = r.Status().Update(ctx, upgrade)
+		return ctrl.Result{}, nil
+	}
+
+	// Revert DNS
+	var cfSecret corev1.Secret
+	secretKey := client.ObjectKey{
+		Namespace: upgrade.Namespace,
+		Name:      upgrade.Spec.EdgeHAConfig.CloudflareSecretRef.Name,
+	}
+	if err := r.Get(ctx, secretKey, &cfSecret); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	cfClient, err := cloudflare.NewClient(string(cfSecret.Data[upgrade.Spec.EdgeHAConfig.CloudflareSecretRef.Key]))
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	err = cfClient.UpdateARecordIP(ctx, upgrade.Spec.EdgeHAConfig.CloudflareZoneID, upgrade.Spec.EdgeHAConfig.DNSRecordName, upgrade.Status.OriginalEdgeIP)
+	if err != nil {
+		log.Error(err, "Failed to revert Cloudflare DNS")
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+
+	transitionState(upgrade, StateWaitingDNSPropagationToEdge, "Edge node upgraded. Reverting Cloudflare A record to original IP.")
+	if err := r.Status().Update(ctx, upgrade); err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+}
+
+func (r *TalosUpgradeReconciler) handleEdgeStateWaitingDNSPropagationToEdge(ctx context.Context, upgrade *upgradev1alpha1.TalosUpgrade) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+	log.Info("Polling DNS to check if traffic shifted back to OriginalEdgeIP")
+
+	if checkTimeout(upgrade, 15*time.Minute) {
+		transitionState(upgrade, "Error", "Timeout waiting for DNS to propagate back.")
+		_ = r.Status().Update(ctx, upgrade)
+		return ctrl.Result{}, nil
+	}
+
+	ips, err := net.LookupHost(upgrade.Spec.EdgeHAConfig.DNSRecordName)
+	if err != nil {
+		log.Error(err, "DNS lookup failed")
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+
+	if !slices.Contains(ips, upgrade.Status.OriginalEdgeIP) {
+		log.Info("DNS not yet propagated back", "expected", upgrade.Status.OriginalEdgeIP, "got", ips)
+		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
+	}
+
+	transitionState(upgrade, StateCleaningUp, "DNS propagated back. Cleaning up temporary proxy.")
+	if err := r.Status().Update(ctx, upgrade); err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{}, nil
+}
+
+func (r *TalosUpgradeReconciler) handleEdgeStateCleaningUp(ctx context.Context, upgrade *upgradev1alpha1.TalosUpgrade) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+	log.Info("Scaling Envoy Proxy back to 1 replica")
+	proxyMgr := envoygateway.NewProxyManager(r.Client)
+	if err := proxyMgr.ScaleProxy(ctx, upgrade.Spec.EdgeHAConfig.EnvoyProxyRef, 1); err != nil {
+		return ctrl.Result{}, err
+	}
+	transitionState(upgrade, StateDone, "Edge Node HA upgrade complete.")
+	upgrade.Status.Phase = PhaseUpToDate
+	if err := r.Status().Update(ctx, upgrade); err != nil {
+		return ctrl.Result{}, err
+	}
 	return ctrl.Result{}, nil
 }
 
@@ -464,7 +468,7 @@ func (r *TalosUpgradeReconciler) reconcileStandardNode(ctx context.Context, upgr
 
 		if checkTimeout(upgrade, 30*time.Minute) {
 			transitionState(upgrade, "Error", fmt.Sprintf("Timeout waiting for node %s to upgrade.", node.Name))
-			r.Status().Update(ctx, upgrade)
+			_ = r.Status().Update(ctx, upgrade)
 			return ctrl.Result{}, nil
 		}
 
